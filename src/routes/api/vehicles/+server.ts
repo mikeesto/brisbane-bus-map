@@ -28,7 +28,9 @@ export const GET: RequestHandler = async ({ fetch }) => {
 					id: vehicle?.vehicle?.id ?? entity.id,
 					latitude: position.latitude,
 					longitude: position.longitude,
-					bearing: position.bearing ?? null,
+					bearing: Object.prototype.hasOwnProperty.call(position, 'bearing')
+						? position.bearing
+						: null,
 					tripId: vehicle?.trip?.tripId ?? null,
 					routeId: vehicle?.trip?.routeId ?? null
 				}
