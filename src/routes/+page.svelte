@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import 'maplibre-gl/dist/maplibre-gl.css';
-	import { SvelteMap } from 'svelte/reactivity';
+	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 	let mapContainer: HTMLDivElement;
 
@@ -17,6 +17,7 @@
 	onMount(() => {
 		let map: import('maplibre-gl').Map | undefined;
 		let interval: ReturnType<typeof setInterval> | undefined;
+		let animationFrame: number | undefined;
 		let destroyed = false;
 
 		const previousPositions = new SvelteMap<
@@ -145,7 +146,105 @@
 					}
 				});
 
-				// Fetch and update vehicle positions
+				const displayed = new SvelteMap<string, Vehicle>();
+				const targets = new SvelteMap<string, Vehicle>();
+
+				const animations = new SvelteMap<
+					string,
+					{
+						from: Vehicle;
+						to: Vehicle;
+						start: number;
+					}
+				>();
+
+				const ANIMATION_DURATION = 16000;
+				const FRAME_INTERVAL = 100; // 10 FPS
+
+				let lastFrame = 0;
+
+				const source = instance.getSource('buses') as import('maplibre-gl').GeoJSONSource;
+
+				// Interpolate headings via the shortest rotation
+				function interpolateBearing(
+					from: number | null,
+					to: number | null,
+					t: number
+				): number | null {
+					if (from === null) return to;
+					if (to === null) return from;
+
+					const difference = ((to - from + 540) % 360) - 180;
+
+					return (from + difference * t + 360) % 360;
+				}
+
+				// Draw the current animated positions
+				function renderFrame(now: number) {
+					animationFrame = undefined;
+
+					if (destroyed) return;
+
+					if (now - lastFrame < FRAME_INTERVAL) {
+						animationFrame = requestAnimationFrame(renderFrame);
+						return;
+					}
+
+					for (const [id, animation] of animations) {
+						const t = Math.min(1, (now - animation.start) / ANIMATION_DURATION);
+
+						const { from, to } = animation;
+
+						displayed.set(id, {
+							...to,
+
+							latitude: from.latitude + (to.latitude - from.latitude) * t,
+
+							longitude: from.longitude + (to.longitude - from.longitude) * t,
+
+							bearing: interpolateBearing(from.bearing, to.bearing, t)
+						});
+
+						if (t >= 1) {
+							animations.delete(id);
+						}
+					}
+
+					// Update all bus markers in one operation
+					source.setData({
+						type: 'FeatureCollection',
+						features: Array.from(displayed.values(), (vehicle) => ({
+							type: 'Feature' as const,
+
+							geometry: {
+								type: 'Point' as const,
+								coordinates: [vehicle.longitude, vehicle.latitude]
+							},
+
+							properties: {
+								id: vehicle.id,
+								routeId: vehicle.routeId,
+								tripId: vehicle.tripId,
+								bearing: vehicle.bearing
+							}
+						}))
+					});
+
+					lastFrame = now;
+
+					// Only keep animating while something is moving
+					if (animations.size > 0) {
+						animationFrame = requestAnimationFrame(renderFrame);
+					}
+				}
+
+				function scheduleRender() {
+					if (animationFrame === undefined) {
+						animationFrame = requestAnimationFrame(renderFrame);
+					}
+				}
+
+				// Fetch fresh GPS positions
 				async function updateVehicles() {
 					try {
 						const response = await fetch('/api/vehicles');
@@ -160,26 +259,70 @@
 
 						if (destroyed) return;
 
-						const geojson = {
-							type: 'FeatureCollection' as const,
-							features: vehicles.map((vehicle) => ({
-								type: 'Feature' as const,
-								geometry: {
-									type: 'Point' as const,
-									coordinates: [vehicle.longitude, vehicle.latitude]
-								},
-								properties: {
-									id: vehicle.id,
-									routeId: vehicle.routeId,
-									tripId: vehicle.tripId,
-									bearing: estimateBearing(vehicle)
+						const now = performance.now();
+						const receivedIds = new SvelteSet<string>();
+
+						for (const incoming of vehicles) {
+							const vehicle: Vehicle = {
+								...incoming,
+								bearing: estimateBearing(incoming)
+							};
+
+							receivedIds.add(vehicle.id);
+
+							const previousTarget = targets.get(vehicle.id);
+
+							// Ignore unchanged GPS readings
+							if (
+								previousTarget &&
+								previousTarget.latitude === vehicle.latitude &&
+								previousTarget.longitude === vehicle.longitude &&
+								previousTarget.bearing === vehicle.bearing
+							) {
+								continue;
+							}
+
+							const current = displayed.get(vehicle.id);
+
+							if (current) {
+								// Approximate distance to detect GPS jumps
+								const lat = (vehicle.latitude * Math.PI) / 180;
+
+								const north = (vehicle.latitude - current.latitude) * 111_320;
+
+								const east = (vehicle.longitude - current.longitude) * Math.cos(lat) * 111_320;
+
+								const distance = Math.hypot(north, east);
+
+								if (distance < 1000) {
+									animations.set(vehicle.id, {
+										from: current,
+										to: vehicle,
+										start: now
+									});
+								} else {
+									// Large jump: reposition without animating
+									displayed.set(vehicle.id, vehicle);
+									animations.delete(vehicle.id);
 								}
-							}))
-						};
+							} else {
+								// New bus: display immediately
+								displayed.set(vehicle.id, vehicle);
+							}
 
-						const source = instance.getSource('buses') as import('maplibre-gl').GeoJSONSource;
+							targets.set(vehicle.id, vehicle);
+						}
 
-						source.setData(geojson);
+						// Remove buses that disappeared from the feed
+						for (const id of displayed.keys()) {
+							if (!receivedIds.has(id)) {
+								displayed.delete(id);
+								targets.delete(id);
+								animations.delete(id);
+							}
+						}
+
+						scheduleRender();
 
 						console.log(`Updated ${vehicles.length} buses`);
 					} catch (error) {
@@ -228,6 +371,10 @@
 
 		return () => {
 			destroyed = true;
+
+			if (animationFrame !== undefined) {
+				cancelAnimationFrame(animationFrame);
+			}
 
 			if (interval) {
 				clearInterval(interval);
